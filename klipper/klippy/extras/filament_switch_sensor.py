@@ -9,6 +9,9 @@
 import logging
 import asyncio
 
+from datetime import datetime
+import time
+
 class RunoutHelper:
     def __init__(self, config):
         self.name = config.get_name().split()[-1]
@@ -31,18 +34,19 @@ class RunoutHelper:
         if config.get('emergency_gcode', None) is not None:
             self.emergency_gcode = gcode_macro.load_template(
                 config, 'emergency_gcode')
-        self.debounce_sample_time = config.getfloat('debounce_sample_time', .1, above=.0)
-        self.debounce_sample_number = config.getint('debounce_sample_number', 10, minval=1)
+        self.debounce_time = config.getfloat('debounce_time', 1.0, above=0.0)
         self.emergency_time = config.getfloat('emergency_time', 10, minval=1)
         self.enable_emergency = config.getboolean('enable_emergency', True)
         self.rele_pin = config.get('rele_pin')
-
+       
         # Internal state
-        self.min_event_systime = self.reactor.NEVER
-        self.pellet_present = False
+        self.pellet_present = None
         self.sensor_enabled = True
-        self.feeder_status = False
-        
+        self.emergency_task = None
+        self.last_state_change_time = time.time()
+        self.last_action = None
+        self.last_emergency_time = None
+
         # Register commands and event handlers
         self.gcode.register_mux_command(
             "QUERY_FILAMENT_SENSOR", "SENSOR", self.name,
@@ -77,18 +81,71 @@ class RunoutHelper:
             logging.exception("Script running error")
 
     def note_filament_present(self, is_pellet_present):
-        if is_pellet_present == self.pellet_present:
+        current_time = time.time()
+
+        # Verifica se il sensore è abilitato, se non lo è non fa nulla
+        if not self.sensor_enabled:
             return
-        self.pellet_present = is_pellet_present
         
-        # Perform pellet action associated with status change (if any)            
-        logging.info("start or restart Debounce")
-        asyncio.run(self.debounce_logic())
+        # Verifica se la stampante è in stampa, nel caso non lo sia non fa nulla
+        eventtime = self.reactor.monotonic()
+        idle_timeout = self.printer.lookup_object("idle_timeout")
+        is_printing = idle_timeout.get_status(eventtime)["state"] == "Printing"
+        if not is_printing:
+            # Se non è in stampa ma il feeder potrebbe essere acceso spegne e ritorna 
+            if self.last_action != 'off':
+                self.filledup()
+            return
+
+        # Verifica se lo stato attuale è diverso dallo stato precedente
+        if is_pellet_present != self.pellet_present:
+            # Aggiorna lo stato corrente e il timestamp dell'ultima modifica
+            self.pellet_present = is_pellet_present
+            self.last_state_change_time = current_time
+
+            # Resetta l'ultima azione
+            self.last_action = None
+        else:
+            # Calcola la differenza di tempo dall'ultima modifica
+            time_diff = current_time - self.last_state_change_time
+
+            # Verifica se è passato più di 1 secondo
+            if time_diff >= self.debounce_time:
+                # Applica la logica di debounce
+                if is_pellet_present and self.last_action != 'off':
+                    self.filledup()
+                elif not is_pellet_present and self.last_action != 'on':
+                    self.runout()
+
+        # Verifica la logica di emergenza
+        if self.enable_emergency and self.last_emergency_time is not None:
+            emergency_time_diff = current_time - self.last_emergency_time
+            if emergency_time_diff >= 10.0:
+                if self.emergency_gcode is not None:
+                    self.emergency()
+
+    def emergency(self):
+        self.reactor.register_callback(self._emergency_event_handler)
+
+    def runout(self):
+        self.reactor.register_callback(self._runout_event_handler)
+
+        # Aggiorna il timestamp dell'ultima emergenza e l'ultima azione
+        self.last_emergency_time = time.time()
+        self.last_action = 'on'
+
+    def filledup(self):
+        self.reactor.register_callback(self._filledup_event_handler)
+
+        # Resettare il timestamp dell'emergenza quando il feeder viene spento e l'ultima azione
+        self.last_emergency_time = None
+        self.last_action = 'off'
 
     def get_status(self, eventtime):
         return {
             "filament_detected": bool(self.pellet_present),
             "enabled": bool(self.sensor_enabled)}
+    
     cmd_QUERY_FILAMENT_SENSOR_help = "Query the status of the pellet Sensor"
     def cmd_QUERY_FILAMENT_SENSOR(self, gcmd):
         if self.pellet_present:
@@ -96,76 +153,10 @@ class RunoutHelper:
         else:
             msg = "Pellet Sensor %s: pellet not detected" % (self.name)
         gcmd.respond_info(msg)
+    
     cmd_SET_FILAMENT_SENSOR_help = "Sets the pellet sensor on/off"
     def cmd_SET_FILAMENT_SENSOR(self, gcmd):
         self.sensor_enabled = gcmd.get_int("ENABLE", 1)
-
-    async def debounce_logic(self):
-        pellet_present_reference = self.pellet_present
-        
-        for _ in range(self.debounce_sample_number):
-            await asyncio.sleep(self.debounce_sample_time) 
-            if pellet_present_reference != self.pellet_present:
-                return
-        
-        eventtime = self.reactor.monotonic()
-        if not self.sensor_enabled:
-            # do not process when the sensor is disabled
-            return
-
-        # Determine "printing" status
-        idle_timeout = self.printer.lookup_object("idle_timeout")
-        is_printing = idle_timeout.get_status(eventtime)["state"] == "Printing"
-        
-        if self.pellet_present:
-            # filledup detected
-            if self.filledup_gcode is not None:
-                logging.info("Pellet Sensor %s: filledup event detected, Time %.2f" % (self.name, eventtime))
-                self.turn_off_feeder()
-        elif is_printing:
-            # runout detected
-            if self.runout_gcode is not None:
-                logging.info("Pellet Sensor %s: runout event detected, Time %.2f" % (self.name, eventtime))
-                self.turn_on_feeder()
-    
-    def turn_on_feeder(self):
-        self.reactor.register_callback(self._runout_event_handler)
-        if self.feeder_status == True:
-            return
-        
-        logging.info("Turn ON feeder")
-        self.feeder_status = True
-
-        #TODO: set the pin to HIGH
-
-        if self.enable_emergency:
-            #start or stop&start emergency timer
-            if self.emergency_task and not self.emergency_task.done():
-                self.emergency_task.cancel()
-            self.emergency_task = asyncio.create_task(self.emergency_stop_feeder())
-
-    def turn_off_feeder(self):
-        self.reactor.register_callback(self._filledup_event_handler)
-        if self.feeder_status == False:
-            return
-        logging.info("Turn OFF feeder")
-        self.feeder_status = False
-
-        #TODO: set the pin to LOW
-
-        if self.enable_emergency:
-            #stop emergency timer
-            if self.emergency_task and not self.emergency_task.done():
-                self.emergency_task.cancel()
-        
-    async def emergency_stop_feeder(self):
-        await asyncio.sleep(self.emergency_time)  
-        logging.info("Emergency stop feeder")
-        if self.emergency_gcode is not None:
-            self.reactor.register_callback(self._emergency_event_handler)
-
-        #TODO: play emergency Tone 
-        #TODO: set the pin to LOW
 
 class SwitchSensor:
     def __init__(self, config):
@@ -205,12 +196,9 @@ def load_config_prefix(config):
 #  sensor_pin:
 #     The pin on which the sensor is connected. This parameter must be
 #     provided.
-#  debounce_sample_time: 0.1
+#  debounce_time: 1.0
 #     The time in seconds between each sample of the sensor. Default is
-#     0.1 seconds.
-#  debounce_sample_number: 10
-#     The number of samples to take before the sensor state is considered  
-#     stable. Default is 10 samples.
+#     1.0 seconds.
 #  emergency_time: 10
 #     The time in seconds to wait before the emergency event is triggered.
 #     Default is 10 seconds.
