@@ -56,7 +56,8 @@ class RunoutHelper:
             "SET_FILAMENT_SENSOR", "SENSOR", self.name,
             self.cmd_SET_FILAMENT_SENSOR,
             desc=self.cmd_SET_FILAMENT_SENSOR_help)
-        
+        #logging.info("filament_switch_sensor initialized")
+
     def _runout_event_handler(self, eventtime):
         # Pausing from inside an event requires that the pause portion
         # of pause_resume execute immediately.
@@ -81,7 +82,9 @@ class RunoutHelper:
             logging.exception("Script running error")
 
     def note_filament_present(self, is_pellet_present):
+
         current_time = time.time()
+        self.gcode.run_script("M118 triggered note_filament_present @ " + str(current_time) + " with status " + str(is_pellet_present))        
 
         # Verifica se il sensore è abilitato, se non lo è non fa nulla
         if not self.sensor_enabled:
@@ -103,18 +106,30 @@ class RunoutHelper:
             self.pellet_present = is_pellet_present
             self.last_state_change_time = current_time
 
+            #logging.info("debounce started @ " + str(current_time) + " with status " + str(is_pellet_present))
+            self.gcode.run_script("M118 debounce started @ " + str(current_time) + " with status " + str(is_pellet_present))
             # Resetta l'ultima azione
             self.last_action = None
+
+            # chiama la funzione dopo il tempo di debonce 
+            self.rerun_note_filament_present(is_pellet_present)
+
         else:
             # Calcola la differenza di tempo dall'ultima modifica
             time_diff = current_time - self.last_state_change_time
 
+            #logging.info("check after " + str(time_diff))
+            self.gcode.run_script("M118 check after " + str(time_diff))
             # Verifica se è passato più di 1 secondo
             if time_diff >= self.debounce_time:
                 # Applica la logica di debounce
                 if is_pellet_present and self.last_action != 'off':
+                    #logging.info("execute filledup")
+                    self.gcode.run_script("M118 execute filledup")
                     self.filledup()
                 elif not is_pellet_present and self.last_action != 'on':
+                    #logging.info("execute runout")
+                    self.gcode.run_script("M118 execute runout")
                     self.runout()
 
         # Verifica la logica di emergenza
@@ -124,18 +139,23 @@ class RunoutHelper:
                 if self.emergency_gcode is not None:
                     self.emergency()
 
+    async def rerun_note_filament_present(self, is_pellet_present):
+        await asyncio.sleep(self.debounce_time + 0.1)
+        self.gcode.run_script("M118 rerun_note_filament_present after debounce time")
+        self.note_filament_present(is_pellet_present)
+
     def emergency(self):
         self.reactor.register_callback(self._emergency_event_handler)
 
     def runout(self):
-        self.reactor.register_callback(self._runout_event_handler)
+        #self.reactor.register_callback(self._runout_event_handler)
 
         # Aggiorna il timestamp dell'ultima emergenza e l'ultima azione
         self.last_emergency_time = time.time()
         self.last_action = 'on'
 
     def filledup(self):
-        self.reactor.register_callback(self._filledup_event_handler)
+        #self.reactor.register_callback(self._filledup_event_handler)
 
         # Resettare il timestamp dell'emergenza quando il feeder viene spento e l'ultima azione
         self.last_emergency_time = None
